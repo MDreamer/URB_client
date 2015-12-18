@@ -91,11 +91,16 @@ void sendDatagram(byte _datagram[16])
 		dbgSerial.write(_datagram,16);
 	}else
 	{
-		dbgSerial.println("AT+CIPCLOSE");
-		if (debug)
-		Serial.println("connect timeout");
-		delay(1000);
+		close_connection();
 		return;
 	}
+	delay(1000);
+}
+
+void close_connection()
+{
+	dbgSerial.println("AT+CIPCLOSE");
+	if (debug)
+	Serial.println("connect timeout, closing it...");
 	delay(1000);
 }

@@ -8,48 +8,31 @@ byte arr[]={0,0,0,0,0,0,0,0,0};
 bool debug = true;
 bool gotData = false;
 bool sendData = false;
+bool isTouched = false;
 int eeprom_addr = 0;
 //datagram description:
 //options 1 byte | source 4 bytes | destination 4 bytes | person_ID 1 byte or animation 1 byte or R+G+B (3bytes) | buffer | buffer | buffer | buffer
 //options - hello = 0(to server), setID = 1(from server), touched = 2(to server), animate = 3(from server), 
 //			setColor = 4(from server), heartbeat = 5(from server)
 byte datagram[16];
-long master_server;
+long val_set=0;
+long master_server=0;
 
-int hearbeat_wd; //heartbeat watchdog
+//animations:
+//1 - charge (suck)
+//2 - discharge
+//3 - sparkle
+bool oneshotCharge = false;
+bool oneshotDischarge = false;
+bool oneshotSparkle = false;
 
 long cur_time = millis();
 long prv_time = 0;
-
+long last_heart_beat = 0;
 //this var is an indication the system got a heartbeat from master_server in the last minutes. if not its sends "Hello" to get an ID.
 bool gotHeartBeat;
 
-//this function send the data to the master server's IP
-//TODO: - check if a X tries is needed before announcing "timeout" 
-void sendDatagram(byte _datagram[16])
-{
-	String cmd;
-	cmd = "AT+CIPSEND=4,9";
-	dbgSerial.println(cmd);
-	//check that the server is willing to get the datagram
-	if(dbgSerial.find(">"))
-	{
-		if (debug)
-		{
-			Serial.print("sending data...");
-			Serial.println(datagram);
-		}
-		dbgSerial.write(_datagram,16);
-	}else
-	{
-		dbgSerial.println("AT+CIPCLOSE");
-		if (debug)
-			Serial.println("connect timeout");
-		delay(1000);
-		return;
-	}
-	delay(1000);
-}
+
 //this function checks the heartbeat content and make sure that the server hasn't changed
 //if it did its asks for a new ID so the new server could manage it
 void heartbeat(byte _datagram[16])
@@ -61,22 +44,13 @@ void heartbeat(byte _datagram[16])
 	val += _datagram[4];
 	
 	if (master_server!= val)
-		dbgSerial.println("AT+CIPCLOSE");
-		hello();
-	
+	{
+		close_connection();
+		helloserver();
+	}
+	last_heart_beat = millis();
 }
-void hello()
-{
-	String conn_cmd;
-	conn_cmd = "AT+CIPSTART=4,\"TCP\",\"";
-	conn_cmd += DST_IP;
-	conn_cmd += "\",2323";
-	if (debug)
-	Serial.println(conn_cmd);
-	dbgSerial.println(conn_cmd);
-	delay(1000);
-	datagram[0] = 0;
-}
+
 void setID(long _id)
 {
 	EEPROM.write(eeprom_addr, _id);
@@ -88,31 +62,14 @@ byte getID()
 
 void setup()
 {
+	datagram[0] = -1 ;
 	// Open serial communications and wait for port to open:
 	//can't be faster than 19200 for softserial
 	dbgSerial.begin(9600);
 	if (debug)
 		Serial.begin(9600);
-		Serial.println("ESP8266");
-	//test if the module is ready
-	bool isReady = false;
-	while (!isReady)
-	{
-		dbgSerial.println("AT+RST");
-		delay(1000);
-		if(dbgSerial.find("ready"))
-		{
-			if (debug)
-				Serial.println("Module is ready");
-			isReady = true;
-		}
-		else
-		{
-			if (debug)
-				Serial.println("Module have no response.");
-		}
-		delay(1000);	
-	}
+		Serial.println("beginning ESP8266... ");
+	resetModule();
 	//connect to the wifi
 	boolean connected=false;
 	while (!connected)
@@ -121,9 +78,12 @@ void setup()
 			connected = true;
 			break;
 		}
-	//print the ip addr
-	dbgSerial.println("AT+CIFSR");
-	Serial.println("ip address:");
+	//print the ip address - only for debugging
+	if (debug)
+	{
+		dbgSerial.println("AT+CIFSR");
+		Serial.println("ip address:");	
+	}
 	//this time frame is needed in order to let the ESP2866 time to 
 	//AT-transmit the command - I guess its because the Arduino MCU is 
 	//too fast for it regrading the commands.
@@ -132,20 +92,28 @@ void setup()
 	{
 		Serial.write(dbgSerial.read());
 	}
-	//set the single connection mode
-	dbgSerial.println("AT+CIPMUX=1");
-	delay(10);
-	String conn_cmd;
-	conn_cmd = "AT+CIPSTART=4,\"TCP\",\"";
-	conn_cmd += DST_IP;
-	conn_cmd += "\",2323";
-	if (debug)
-		Serial.println(conn_cmd);
-	dbgSerial.println(conn_cmd);
-	delay(1000);
+	connect_to_server();
 }
 void loop()
 {
+	//this is the part where the sensor integration comes in.
+	if (isTouched)
+	{
+		datagram[0] = 2;
+		//source - the bush
+		long val_ID = getID();
+		datagram[1] = val_ID << 24;
+		datagram[2] = val_ID << 16;
+		datagram[3] = val_ID << 8;
+		datagram[4] = val_ID;
+		// destination - the server
+		datagram[5] = master_server << 24;
+		datagram[6] = master_server << 16;
+		datagram[7] = master_server << 8;
+		datagram[8] = master_server;
+		//datagram[9] = sensor data..
+	}
+		
 	String cmd;
 	cmd = "AT+CIPSEND=4,9";
 	dbgSerial.println(cmd);
@@ -177,55 +145,42 @@ void loop()
 		//after we get a datagram we need to check the "option" byte of it in order to know which function to trigger
 		switch (datagram[0])
 		{
+			//says hello to server
 			case 0:
-				hello();
+				helloserver();
 				break;
+			//gets an ID from server
 			case 1:
-				long val=0;
-				val += datagram[5] << 24;
-				val += datagram[6] << 16;
-				val += datagram[7] << 8;
-				val += datagram[8];
-				setID(val);
+				val_set += datagram[5] << 24;
+				val_set += datagram[6] << 16;
+				val_set += datagram[7] << 8;
+				val_set += datagram[8];
+				setID(val_set);
 				break;
 			//touched
 			case 2:
-			
+				sendDatagram(datagram);
 				break;
-			
+			//animate
 			case 3:
-			break;
-			
+				break;
+			//set color
 			case 4:
-			break;
+				break;
+			//heartbeat from server
 			case 5:
 				heartbeat(datagram);
-			break;
+				break;
 			default:
-			/* Your code here */
-			break;
+				break;
 		}
 	}
-	
-}
-boolean connectWiFi()
-{
-	dbgSerial.println("AT+CWMODE=1");
-	String cmd="AT+CWJAP=\"";
-	cmd+=SSID;
-	cmd+="\",\"";
-	cmd+=PASS;
-	cmd+="\"";
-	Serial.println(cmd);
-	dbgSerial.println(cmd);
-	delay(5000);
-	if(dbgSerial.find("OK"))
-	{
-		Serial.println("OK, Connected to WiFi.");
-		return true;
-	}else
-	{
-		Serial.println("Can not connect to the WiFi.");
-		return false;
-	}
+	//we expect heartbeat every 1 minute - if it fails the bush closes the current connection, 
+	//opens and new one and asks for a new ID.
+	if (abs(cur_time - prv_time)>1000*60 && master_server != 0)
+		if (abs(last_heart_beat - cur_time) > 1000*60)
+		{
+			close_connection();
+			helloserver();
+		}
 }
